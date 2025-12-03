@@ -1,6 +1,9 @@
 import os
 import requests
 import json
+import re
+import time
+from collections import Counter
 
 # Config
 API_KEY  = os.getenv("OPENAI_API_KEY", "cse476")
@@ -29,7 +32,7 @@ def call_model_chat_completions(prompt: str,
             {"role": "user",   "content": prompt}
         ],
         "temperature": temperature,
-        "max_tokens": 128,
+        "max_tokens": 256,
     }
 
     try:
@@ -51,24 +54,53 @@ def call_model_chat_completions(prompt: str,
     except requests.RequestException as e:
         return {"ok": False, "text": None, "raw": None, "status": -1, "error": str(e), "headers": {}}
 
+def solve_with_cot(question: str):
+    system_prompt = "You are a logical solver. Think step-by-step. End your response with 'FINAL ANSWER: <your answer>'."
+    prompt = f"Question: {question}\n\nLet's think step by step."
+    result = call_model_chat_completions(prompt, system=system_prompt, temperature=0.0)
 
+    if result["ok"]:
+        text = result["text"]
+        if "FINAL ANSWER:" in text:
+            return text.split("FINAL ANSWER")[-1].strip()
+        return text
+    return "ERROR"
 
-if __name__ == "__main__":
-    test_prompt = "What is 10 + 10? Please answer only with the number."
+def strategy_self_consistency(question: str, num_samples: int = 3) -> str:
 
-    print("Sending out test prompt...")
-    print(f" >> {test_prompt}")
+    answers = []
+    system_prompt = "Solve the problem. Reply ONLY with the final answer. No explanation."
+    
+    for _ in range(num_samples):
+        r = call_model_chat_completions(question, system=system_prompt, temperature=0.7)
+        text = r["text"] if r["ok"] else None
+        if text:
+            answers.append(text)
+        time.sleep(0.1)
 
-    outcome = call_model_chat_completions(test_prompt)
+    if answers == []:
+        return "ERROR"
 
-    print()
+    
+    tally = Counter(answers)
+    choice = tally.most_common(1)
+    winner = choice[0][0]
+    return winner
 
-    if outcome.get("ok"):
-        print("Success!.")
-        print("-" * 32)
-        print("Model said:", outcome["text"])
-        print("-" * 32)
-    else:
-        print("Error.")
-        print(f"Status Code: {outcome.get('status')}")
-        print(f"Details: {outcome.get('error')}")
+def strategy_refinement(question: str) -> str:
+    draft_result = call_model_chat_completions(question, temperature=0.0)
+    if not draft_result["ok"]: return "ERROR"
+    draft = draft_result["text"]
+    
+    critique_prompt = (
+        f"Question: {question}\n"
+        f"Proposed Answer: {draft}\n"
+        "Critique this answer for logical or arithmetic errors. "
+        "Then provide the corrected FINAL ANSWER only."
+    )
+    final_res = call_model_chat_completions(critique_prompt, system="You are a strict reviewer.", temperature=0.0)
+    
+    if final_res["ok"]:
+        return final_res["text"]
+    return draft
+
