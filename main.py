@@ -157,27 +157,35 @@ class AgentStrategies:
         return last_line
 
     def solve_coding(self, user_input: str) -> str:
-        # Code Completion Mode
+        # First pass
         system = (
-            "You are a Python coding assistant. "
-            "Complete the function or code block provided.\n"
-            "1. Output ONLY the code body.\n"
-            "2. Do NOT output 'def function_name...'.\n"
-            "3. Do NOT wrap in markdown (no ```).\n"
-            "4. Follow strict indentation (4 spaces)."
+            "You are a Python coding assistant. Complete the function provided.\n"
+            "Rules: 1. Output ONLY code body. 2. No imports. 3. No function def signature. 4. Indent 4 spaces."
         )
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user_input}]
-        resp = call_llm(messages, temperature=0.0)
+        code_draft = call_llm(messages, temperature=0.0)
         
-        # Cleanup: Remove markdown and def lines
-        clean = resp.replace("```python", "").replace("```", "").strip()
+        # Second pass critique
+        critique_prompt = (
+            f"Here is a draft code snippet:\n{code_draft}\n\n"
+            "Check this code against these rules:\n"
+            "1. Does it include the 'def' line? (It should NOT).\n"
+            "2. Does it include imports? (It should NOT).\n"
+            "3. Is the indentation correct?\n"
+            "Output the FIXED code only. If it was already correct, output it unchanged"
+        )
+        
+        messages.append({"role": "assistant", "content": code_draft})
+        messages.append({"role": "user", "content": critique_prompt})
+        
+        fixed_code = call_llm(messages, temperature=0.0)
+        
+        # Cleanup
+        clean = fixed_code.replace("```python", "").replace("```", "").strip()
         lines = clean.split('\n')
         if lines and lines[0].strip().startswith("def "):
             clean = "\n".join(lines[1:])
         return clean
-
-    
-    import re
 
     def solve_planning(self, user_input: str) -> str:
         # Strategy: Chain of Thought (CoT) + Action Mapping
