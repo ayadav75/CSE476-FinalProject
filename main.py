@@ -3,8 +3,10 @@ import json
 import re
 import time
 import requests
+import threading 
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from ddgs import DDGS  
 
 # Config
@@ -12,9 +14,14 @@ API_KEY = os.getenv("OPENAI_API_KEY", "cse476")
 API_BASE = os.getenv("API_BASE", "http://10.4.58.53:41701/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "bens_model")
 
+# Threading Config
+MAX_WORKERS = 20
+SEARCH_LOCK = threading.Lock() # Prevents DuckDuckGo bans
+FILE_LOCK = threading.Lock()   # Prevents JSON corruption
+
 # File Paths
-INPUT_PATH = Path("cse_476_final_project_test_data.json") 
-OUTPUT_PATH = Path("cse_476_final_project_answers.json")
+INPUT_PATH = Path("cse476_final_project_dev_data.json") 
+OUTPUT_PATH = Path("cse_476_final_project_answers_test.json")
 
 # Modified API client
 
@@ -46,27 +53,29 @@ def internet_search(query: str, num_results: int = 3) -> str:
     Performs a DuckDuckGo Search and returns a summary string.
     """
     # print(f"\n[Search] Query: {query}") 
-    try:
-        # pass query as positional argument
-        results = list(DDGS().text(query, max_results=num_results))
-        
-        if not results:
-            print("[Search] No results found.")
+    # To avoid getting banned
+    with SEARCH_LOCK:
+        try:
+            # pass query as positional argument
+            results = list(DDGS().text(query, max_results=num_results))
+            
+            if not results:
+                print("[Search] No results found.")
+                return ""
+            
+            context_pieces = []
+            for item in results:
+                title = item.get("title", "No Title")
+                snippet = item.get("body", "No Snippet")
+                context_pieces.append(f"Source: {title}\nContent: {snippet}\n")
+            
+            context_str = "\n---\n".join(context_pieces)
+            # print(f"[Search] Context Length: {len(context_str)} chars") 
+            return context_str
+            
+        except Exception as e:
+            print(f"[Search] Error: {e}")
             return ""
-        
-        context_pieces = []
-        for item in results:
-            title = item.get("title", "No Title")
-            snippet = item.get("body", "No Snippet")
-            context_pieces.append(f"Source: {title}\nContent: {snippet}\n")
-        
-        context_str = "\n---\n".join(context_pieces)
-        # print(f"[Search] Context Length: {len(context_str)} chars") 
-        return context_str
-        
-    except Exception as e:
-        print(f"[Search] Error: {e}")
-        return ""
 
 # Domain Classifier
 # Asks the LLM to categorize the input into one of the 5 known domains.
@@ -107,24 +116,45 @@ def classify_domain(user_input: str) -> str:
 class AgentStrategies:
     
     def solve_math(self, user_input: str) -> str:
-        # CoT + Strict Number Extraction Format
+        # Strategy: Few-Shot Chain-of-Thought (CoT)
+        
         system = (
-            "You are a math expert. Solve the problem step-by-step.\n"
-            "At the very end, output the final numeric answer strictly in this format:\n"
-            "#### <NUMBER>\n"
-            "Example: #### 42"
+            "You are a mathematical reasoning expert. Solve the problem step-by-step.\n\n"
+            "RULES:\n"
+            "1. Show your work/reasoning clearly before the final answer.\n"
+            "2. If the problem involves calculations, double-check your arithmetic.\n"
+            "3. If the answer is a fraction, simplify it. If it is a decimal, keep significant figures.\n"
+            "4. CRITICAL: End your response strictly with '####' followed by the final answer.\n"
+            "5. Do not include units in the final answer (after ####) unless explicitly asked.\n\n"
+            "EXAMPLES:\n"
+            "User: What is 15% of 80?\n"
+            "Your answer: 15% is 0.15. 0.15 * 80 = 12. #### 12\n\n"
+            "User: Solve for x: 2x + 5 = 15\n"
+            "Your response: Subtract 5 from both sides: 2x = 10. Divide by 2: x = 5. #### 5\n\n"
+            "User: Find the sum of the first 5 prime numbers.\n"
+            "Your answer: Primes are 2, 3, 5, 7, 11. Sum = 2+3+5+7+11 = 28. #### 28"
         )
+        
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user_input}]
         
-        raw_resp = call_llm(messages, temperature=0.2)
+        raw_resp = call_llm(messages, temperature=0.1)
         
-        # only take after delim
+        # Delimiter extraction
         if "####" in raw_resp:
             return raw_resp.split("####")[-1].strip()
+            
+        # No delim
+        lines = [line.strip() for line in raw_resp.split('\n') if line.strip()]
+        if not lines:
+            return "0" # Total failure fallback
+            
+        last_line = lines[-1]
         
-        #If no delimiter, try to find the last number or return the last line
-        lines = raw_resp.strip().split('\n')
-        return lines[-1].strip()
+        # Last line check
+        if "answer" in last_line.lower():
+            return last_line.split(":")[-1].strip()
+            
+        return last_line
 
     def solve_coding(self, user_input: str) -> str:
         # Code Completion Mode
@@ -314,7 +344,8 @@ class AgentStrategies:
             "2. GRAMMAR CHECK: If the user asks 'it is also called what', ensure you identify the correct subject.\n"
             "3. Output format: First provide concise reasoning, then '####', then the FINAL SHORT ANSWER.\n"
             "   Example: 'Search results indicate the capital is Paris. #### Paris'\n"
-            "4. If Search Results are empty or irrelevant, strictly use your own internal knowledge."
+            "4. If Search Results are empty or irrelevant, strictly use your own internal knowledge.\n"
+            "5. If it is a yes or no answer, answer with a definite yes or no only."
         )
         
         augmented_input = (
@@ -334,8 +365,8 @@ class AgentStrategies:
             
         # Boolean Mapping
         lower_ans = answer.lower().replace(".", "")
-        if lower_ans in ["yes", "correct", "true"]: return "true"
-        if lower_ans in ["no", "incorrect", "false"]: return "false"
+        if lower_ans in ["yes", "correct", "true", "['Yes']", "['YES']"]: return "true"
+        if lower_ans in ["no", "incorrect", "false", "['No']", "['NO']"]: return "false"
         
         return answer.strip(" .\"'")
 
@@ -370,6 +401,37 @@ class AgentStrategies:
                 answer = answer.split(":")[-1].strip()
             
         return answer.strip(" .\"'")
+    
+def validate_answer(answer_str: str) -> str:
+    """Ensure answer meets submission requirements."""
+    if not isinstance(answer_str, str):
+        return str(answer_str)
+    if len(answer_str) >= 5000:
+        return answer_str[:4900] + "...[TRUNCATED]"
+    return answer_str
+    
+def process_item(index: int, item: Dict[str, Any]) -> tuple:
+    """Worker function for threading."""
+    solver = AgentStrategies()
+    user_input = item.get("input", "")
+    
+    try:
+        inferred_domain = classify_domain(user_input)
+        
+        if inferred_domain == "math": prediction = solver.solve_math(user_input)
+        elif inferred_domain == "coding": prediction = solver.solve_coding(user_input)
+        elif inferred_domain == "planning": prediction = solver.solve_planning(user_input)
+        elif inferred_domain == "future_prediction": prediction = solver.solve_prediction(user_input)
+        else: prediction = solver.solve_common_sense(user_input)
+    except Exception as e:
+        print(f"Error on item {index}: {e}")
+        prediction = "Error"
+        inferred_domain = "Error"
+
+    prediction = validate_answer(prediction)
+    print(f"ID: {index+1:<4} | Domain: {inferred_domain:<15} | Completed")
+    
+    return index, prediction
 
 
 # MAIN EXECUTION
@@ -382,49 +444,55 @@ def main():
     with open(INPUT_PATH, 'r', encoding="utf-8") as f:
         all_data = json.load(f)
 
-    test_batch = all_data[0:10]
+    all_data = all_data[900:920]
 
-    solver = AgentStrategies()
-    results = []
+    final_outputs = [None] * len(all_data)
 
-    total_count = 0
+    # Make json file recoverable 
+    processed_indices = set()
+    if OUTPUT_PATH.exists():
+        try:
+            with open(OUTPUT_PATH, 'r', encoding="utf-8") as f:
+                loaded = json.load(f)
+                if len(loaded) <= len(all_data):
+                    # Fill what we have so far
+                    for i, obj in enumerate(loaded):
+                        final_outputs[i] = obj
+                        processed_indices.add(i)
+                    print(f"Resuming... {len(processed_indices)} items already done.")
+        except:
+            print("Could not read existing file. Starting fresh.")
 
-    print(f"{'ID':<4} | {'TRUE DOM':<10} | {'INF DOM':<10} | {'JUDGE':<8} | {'DETAILS'}")
-    print("-" * 100)
+    # Identify which items need processing
+    items_to_process = []
+    for i, item in enumerate(all_data):
+        if i not in processed_indices:
+            items_to_process.append((i, item))
 
-    for i, item in enumerate(test_batch):
-        user_input = item.get("input", "")
+    if not items_to_process:
+        print("All items completed.")
+        return
 
-        # Classify Domain
-        inferred_domain = classify_domain(user_input)
-
-        # 2. Route to Solver
-        if inferred_domain == "math":
-            prediction = solver.solve_math(user_input)
-        elif inferred_domain == "coding":
-            prediction = solver.solve_coding(user_input)
-        elif inferred_domain == "planning":
-            prediction = solver.solve_planning(user_input)
-        elif inferred_domain == "future_prediction":
-            prediction = solver.solve_prediction(user_input)
-        else:
-            prediction = solver.solve_common_sense(user_input)
-
-        # Store result
-        results.append({"output": prediction})
-
-        print(f"{i+1:<4} | {inferred_domain:<15} | Generated")
-
-        # Rate limit
-        time.sleep(0.2)
-
-    # Save Final JSON
-    with open(OUTPUT_PATH, 'w', encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
+    print(f"Starting threads with {MAX_WORKERS} workers...")
     
-    print("-" * 40)
-    print(f"Done. Processed {len(results)} items.")
-    print(f"Full outputs saved to {OUTPUT_PATH}")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit tasks
+        future_to_idx = {executor.submit(process_item, idx, item): idx for idx, item in items_to_process}
+        
+        for future in as_completed(future_to_idx):
+            idx, prediction = future.result()
+            
+            # Store result in the correct index position
+            final_outputs[idx] = {"output": prediction}
+            
+            # Write File Safe
+            with FILE_LOCK:
+                save_data = [x for x in final_outputs if x is not None]
+                
+                with open(OUTPUT_PATH, 'w', encoding="utf-8") as f:
+                    json.dump(save_data, f, indent=2, ensure_ascii=False)
+
+    print(f"Done. Outputs saved to {OUTPUT_PATH}")
 
 if __name__ == "__main__":
     main()
