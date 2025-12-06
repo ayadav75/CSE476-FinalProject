@@ -15,7 +15,7 @@ API_BASE = os.getenv("API_BASE", "http://10.4.58.53:41701/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "bens_model")
 
 # Threading Config
-MAX_WORKERS = 20
+MAX_WORKERS = 15
 SEARCH_LOCK = threading.Lock() # Prevents DuckDuckGo bans
 FILE_LOCK = threading.Lock()   # Prevents JSON corruption
 
@@ -53,7 +53,7 @@ def internet_search(query: str, num_results: int = 3) -> str:
     Performs a DuckDuckGo Search and returns a summary string.
     """
     # print(f"\n[Search] Query: {query}") 
-    # To avoid getting banned
+    # To avoid getting banned I have used locks for searches
     with SEARCH_LOCK:
         try:
             # pass query as positional argument
@@ -78,7 +78,7 @@ def internet_search(query: str, num_results: int = 3) -> str:
             return ""
 
 # Domain Classifier
-# Asks the LLM to categorize the input into one of the 5 known domains.
+# Asks the LLM to categorize the input into one of the 5 known domains
 
 def classify_domain(user_input: str) -> str:
     system_prompt = (
@@ -156,6 +156,7 @@ class AgentStrategies:
             
         return last_line
 
+    # Using Self-Correction method
     def solve_coding(self, user_input: str) -> str:
         # First pass
         system = (
@@ -188,8 +189,7 @@ class AgentStrategies:
         return clean
 
     def solve_planning(self, user_input: str) -> str:
-        # Strategy: Chain of Thought (CoT) + Action Mapping
-        # We allow the model to "think" about the state to improve logic, then extract lines
+        # Strategy: Chain of Thought (CoT) and some action mapping
         
         system = (
             "You are an expert PDDL planning engine.\n"
@@ -282,6 +282,9 @@ class AgentStrategies:
 
 
     def solve_common_sense(self, user_input: str) -> str:
+
+        if len(user_input) > 500 or "context" in user_input.lower():
+            return self._solve_comprehension(user_input)
         # Decision
         decision_system = (
             "You are a routing agent. Analyze the user input.\n"
@@ -299,15 +302,15 @@ class AgentStrategies:
         
         print(f"[Agent] Routing Decision: {decision}")
 
-        if "COMPREHENSION" in decision:
-            return self._solve_comprehension(user_input)
+        if "SEARCH" in decision:
+            return self._solve_search_based(user_input)
         elif "MULTIPLE_CHOICE" in decision:
             return self._solve_multiple_choice(user_input)
         else:
-            return self._solve_search_based(user_input)
+            return self._solve_comprehension(user_input)
 
     def _solve_multiple_choice(self, user_input: str) -> str:
-        # Strategy: Search -> Reason -> Select Exact String
+        # Strategy: Search then -> Reason then -> Select Exact String
         
         core_question = user_input.split('\n')[0]
         if len(core_question) < 10:
@@ -391,7 +394,7 @@ class AgentStrategies:
             "1. Analyze the question to identify the specific event, entity, or relationship requested.\n"
             "2. Scan the text for all relevant mentions (not just the first one).\n"
             "3. Reason about the context: If there are conflicting facts (e.g., a rejected treaty vs a ratified one), "
-            "choose the one that best satisfies the specific phrasing of the question.\n"
+            "choose the one that best satisfies the specific phrasing of the question. Always answer logically and deterministically.\n"
             "4. Output the final short answer.\n\n"
             "FORMAT:\n"
             "Provide a brief reasoning line, then '####', then the FINAL ANSWER ENTITY.\n"
@@ -411,15 +414,14 @@ class AgentStrategies:
         return answer.strip(" .\"'")
     
 def validate_answer(answer_str: str) -> str:
-    """Ensure answer meets submission requirements."""
     if not isinstance(answer_str, str):
         return str(answer_str)
     if len(answer_str) >= 5000:
         return answer_str[:4900] + "...[TRUNCATED]"
     return answer_str
     
+# Worker function for threading arranges items
 def process_item(index: int, item: Dict[str, Any]) -> tuple:
-    """Worker function for threading."""
     solver = AgentStrategies()
     user_input = item.get("input", "")
     
@@ -452,7 +454,7 @@ def main():
     with open(INPUT_PATH, 'r', encoding="utf-8") as f:
         all_data = json.load(f)
 
-    all_data = all_data[900:920]
+    all_data = all_data[500:505]
 
     final_outputs = [None] * len(all_data)
 
@@ -482,7 +484,7 @@ def main():
         return
 
     print(f"Starting threads with {MAX_WORKERS} workers...")
-    
+    start_time = time.perf_counter()
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         # Submit tasks
         future_to_idx = {executor.submit(process_item, idx, item): idx for idx, item in items_to_process}
@@ -499,6 +501,8 @@ def main():
                 
                 with open(OUTPUT_PATH, 'w', encoding="utf-8") as f:
                     json.dump(save_data, f, indent=2, ensure_ascii=False)
+    end_time = time.perf_counter()
+    print("Execution Time: ", end_time-start_time)
 
     print(f"Done. Outputs saved to {OUTPUT_PATH}")
 
