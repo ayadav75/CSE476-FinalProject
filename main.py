@@ -20,8 +20,8 @@ SEARCH_LOCK = threading.Lock() # Prevents DuckDuckGo bans
 FILE_LOCK = threading.Lock()   # Prevents JSON corruption
 
 # File Paths
-INPUT_PATH = Path("cse476_final_project_dev_data.json") 
-OUTPUT_PATH = Path("cse_476_final_project_answers_test.json")
+INPUT_PATH = Path("cse_476_final_project_test_data.json") 
+OUTPUT_PATH = Path("cse_476_final_project_answers.json")
 
 # Modified API client
 
@@ -454,7 +454,7 @@ def main():
     with open(INPUT_PATH, 'r', encoding="utf-8") as f:
         all_data = json.load(f)
 
-    all_data = all_data[500:505]
+    all_data = all_data[0:50]
 
     final_outputs = [None] * len(all_data)
 
@@ -485,6 +485,7 @@ def main():
 
     print(f"Starting threads with {MAX_WORKERS} workers...")
     start_time = time.perf_counter()
+    completed_questions = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         # Submit tasks
         future_to_idx = {executor.submit(process_item, idx, item): idx for idx, item in items_to_process}
@@ -494,6 +495,8 @@ def main():
             
             # Store result in the correct index position
             final_outputs[idx] = {"output": prediction}
+            completed_questions += 1
+            print("Progress: ", completed_questions)
             
             # Write File Safe
             with FILE_LOCK:
