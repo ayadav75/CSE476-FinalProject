@@ -7,16 +7,16 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from ddgs import DDGS  
 
-# --- Configuration ---
+# Config
 API_KEY = os.getenv("OPENAI_API_KEY", "cse476")
 API_BASE = os.getenv("API_BASE", "http://10.4.58.53:41701/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "bens_model")
 
 # File Paths
-INPUT_PATH = Path("cse476_final_project_dev_data.json") 
+INPUT_PATH = Path("cse_476_final_project_test_data.json") 
 OUTPUT_PATH = Path("cse_476_final_project_answers.json")
 
-# --- 1. API Client ---
+# Modified API client
 
 def call_llm(messages: List[Dict[str, str]], temperature: float = 0.0, max_tokens: int = 2048) -> str:
     """Standard API wrapper with retry logic."""
@@ -40,7 +40,7 @@ def call_llm(messages: List[Dict[str, str]], temperature: float = 0.0, max_token
         time.sleep(1)
     return ""
 
-# --- Tool: Internet Search (DuckDuckGo) ---
+# Tool: Internet Search (DuckDuckGo) 
 def internet_search(query: str, num_results: int = 3) -> str:
     """
     Performs a DuckDuckGo Search and returns a summary string.
@@ -68,12 +68,10 @@ def internet_search(query: str, num_results: int = 3) -> str:
         print(f"[Search] Error: {e}")
         return ""
 
-# --- 2. The Domain Classifier ---
+# Domain Classifier
+# Asks the LLM to categorize the input into one of the 5 known domains.
 
 def classify_domain(user_input: str) -> str:
-    """
-    Asks the LLM to categorize the input into one of the 5 known domains.
-    """
     system_prompt = (
         "You are a classification agent. "
         "Analyze the user input and categorize it into exactly one of these domains:\n"
@@ -117,7 +115,16 @@ class AgentStrategies:
             "Example: #### 42"
         )
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user_input}]
-        return call_llm(messages, temperature=0.2)
+        
+        raw_resp = call_llm(messages, temperature=0.2)
+        
+        # only take after delim
+        if "####" in raw_resp:
+            return raw_resp.split("####")[-1].strip()
+        
+        #If no delimiter, try to find the last number or return the last line
+        lines = raw_resp.strip().split('\n')
+        return lines[-1].strip()
 
     def solve_coding(self, user_input: str) -> str:
         # Code Completion Mode
@@ -294,76 +301,78 @@ class AgentStrategies:
         
         return cleaned_resp.strip(" .\"'")
 
-
-def normalize_text(text: str) -> str:
-    """Basic text normalization."""
-    if not text: return ""
-    return str(text).strip().lower()
-
-def extract_number(text: str) -> Optional[float]:
-    """Extracts numbers for math comparison."""
-    if not text: return None
-    matches = re.findall(r"[-+]?(?:\d+\.?\d*|\.\d+)", str(text))
-    if matches:
-        try:
-            return float(matches[-1])
-        except ValueError:
-            return None
-    return None
-
-# Taken from evaluate_results.py and modified
-def llm_judge_check(question: str, prediction: str, expected: str) -> bool:
-    """Uses the LLM to judge semantic correctness."""
-    prompt = (
-        "You are a strict grader. Compare the PREDICTION to the EXPECTED ANSWER.\n"
-        "Return the word 'TRUE' if the prediction means the same thing, contains the correct code logic, or is a valid equivalent.\n"
-        "Return 'FALSE' otherwise.\n\n"
-        f"QUESTION START: {question[:200]}...\n"
-        f"EXPECTED: {expected}\n"
-        f"PREDICTION: {prediction}\n\n"
-        "Verdict (TRUE/FALSE):"
-    )
-    # We use a quick call for judging
-    verdict = call_llm([{"role": "user", "content": prompt}], temperature=0.0, max_tokens=5)
-    return "TRUE" in verdict.upper()
-
-def evaluate_single_item(item: Dict, prediction: str, inferred_domain: str) -> bool:
-    expected = item.get("output")
-    input_text = item.get("input", "")
-    if expected is None: return False
-
-    # Math
-    if inferred_domain == "math":
-        p_num = extract_number(prediction)
-        e_num = extract_number(expected)
-        if p_num is not None and e_num is not None:
-            return abs(p_num - e_num) < 1e-6
-
-    # Planning / Coding / Future
-    if inferred_domain in ["planning", "coding", "future_prediction"]:
-        p_norm = "".join(str(prediction).split()).lower().replace("['", "").replace("']", "")
-        e_norm = "".join(str(expected).split()).lower().replace("['", "").replace("']", "")
-        if e_norm in p_norm or p_norm == e_norm: return True
-
-    # Common Sense - Boolean Handling
-    p_str = str(prediction).lower().strip()
-    e_str = str(expected).lower().strip()
-    
-    if p_str == e_str: 
-        return True
+    def _solve_search_based(self, user_input: str) -> str:
+        # Direct Search 
+        search_context = internet_search(user_input)
         
-    # If expected is specifically boolean-like
-    if e_str in ["true", "false"]:
-        # Map yes/no just in case logic slipped
-        if p_str == "yes": p_str = "true"
-        if p_str == "no": p_str = "false"
-        return p_str == e_str
+        # Reasoning & Extraction
+        system = (
+            "You are a specific fact extractor. "
+            "Use the provided Search Results to answer the user's question.\n\n"
+            "CRITICAL INSTRUCTIONS:\n"
+            "1. Read the search results to find the specific entity (name, place, chemical, year, etc.).\n"
+            "2. GRAMMAR CHECK: If the user asks 'it is also called what', ensure you identify the correct subject.\n"
+            "3. Output format: First provide concise reasoning, then '####', then the FINAL SHORT ANSWER.\n"
+            "   Example: 'Search results indicate the capital is Paris. #### Paris'\n"
+            "4. If Search Results are empty or irrelevant, strictly use your own internal knowledge."
+        )
+        
+        augmented_input = (
+            f"Question: {user_input}\n\n"
+            f"Search Results:\n{search_context}\n\n"
+            "Final Answer (Reasoning #### Entity):"
+        )
+        
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": augmented_input}]
+        resp = call_llm(messages, temperature=0.0).strip()
+        
+        # Extraction of clean output
+        if "####" in resp:
+            answer = resp.split("####")[-1].strip()
+        else:
+            answer = resp.split('\n')[-1].strip()
+            
+        # Boolean Mapping
+        lower_ans = answer.lower().replace(".", "")
+        if lower_ans in ["yes", "correct", "true"]: return "true"
+        if lower_ans in ["no", "incorrect", "false"]: return "false"
+        
+        return answer.strip(" .\"'")
 
-    # 4. Fallback: LLM Judge
-    return llm_judge_check(input_text, prediction, expected)
+    def _solve_comprehension(self, user_input: str) -> str:
+        # Reasoning-Based Q&A
+        safe_input = user_input
+        if len(safe_input) > 30000:
+            safe_input = safe_input[:30000] + "\n...[TRUNCATED]..."
 
-# --- 5. Main Execution Loop ---
+        system = (
+            "You are a Reading Comprehension expert. "
+            "Your goal is to answer the question using ONLY the provided text.\n\n"
+            "PROCESS:\n"
+            "1. Analyze the question to identify the specific event, entity, or relationship requested.\n"
+            "2. Scan the text for all relevant mentions (not just the first one).\n"
+            "3. Reason about the context: If there are conflicting facts (e.g., a rejected treaty vs a ratified one), "
+            "choose the one that best satisfies the specific phrasing of the question.\n"
+            "4. Output the final short answer.\n\n"
+            "FORMAT:\n"
+            "Provide a brief reasoning line, then '####', then the FINAL ANSWER ENTITY.\n"
+            "Example: 'The text explains that X rejected the treaty, but Y signed it. #### Y'"
+        )
+        
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": safe_input}]
+        resp = call_llm(messages, temperature=0.0, max_tokens=512).strip()
+        
+        if "####" in resp:
+            answer = resp.split("####")[-1].strip()
+        else:
+            answer = resp.split("\n")[-1].strip()
+            if ":" in answer:
+                answer = answer.split(":")[-1].strip()
+            
+        return answer.strip(" .\"'")
 
+
+# MAIN EXECUTION
 def main():
     if not INPUT_PATH.exists():
         print(f"Error: {INPUT_PATH} not found.")
@@ -373,12 +382,11 @@ def main():
     with open(INPUT_PATH, 'r', encoding="utf-8") as f:
         all_data = json.load(f)
 
-    test_batch = all_data[995:] 
+    test_batch = all_data[0:10]
 
     solver = AgentStrategies()
     results = []
-    
-    correct_count = 0
+
     total_count = 0
 
     print(f"{'ID':<4} | {'TRUE DOM':<10} | {'INF DOM':<10} | {'JUDGE':<8} | {'DETAILS'}")
@@ -386,9 +394,8 @@ def main():
 
     for i, item in enumerate(test_batch):
         user_input = item.get("input", "")
-        true_domain = item.get("domain", "N/A")
 
-        # 1. Classify Domain
+        # Classify Domain
         inferred_domain = classify_domain(user_input)
 
         # 2. Route to Solver
@@ -404,38 +411,20 @@ def main():
             prediction = solver.solve_common_sense(user_input)
 
         # Store result
-        results.append({
-            "input": user_input,
-            "output": prediction
-        })
+        results.append({"output": prediction})
 
-        # Evaluate 
-        if "output" in item:
-            total_count += 1
-            is_pass = evaluate_single_item(item, prediction, inferred_domain)
-            
-            judge_str = "✅ PASS" if is_pass else "❌ FAIL"
-            if is_pass: correct_count += 1
-            
-            # Truncate for display
-            clean_pred = str(prediction).replace("\n", " ")[:30]
-            print(f"{i:<4} | {true_domain:<10} | {inferred_domain:<10} | {judge_str:<8} | Out: {clean_pred}...")
-        else:
-            print(f"{i:<4} | {true_domain:<10} | {inferred_domain:<10} | {'SKIP':<8} | (No ground truth)")
+        print(f"{i+1:<4} | {inferred_domain:<15} | Generated")
 
         # Rate limit
         time.sleep(0.2)
 
-    # Final Stats
-    if total_count > 0:
-        print("-" * 100)
-        print(f"Accuracy: {correct_count}/{total_count} ({correct_count/total_count*100:.1f}%)")
-
-    # Save to JSON
+    # Save Final JSON
     with open(OUTPUT_PATH, 'w', encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
     
-    print(f"\nFull outputs saved to {OUTPUT_PATH}")
+    print("-" * 40)
+    print(f"Done. Processed {len(results)} items.")
+    print(f"Full outputs saved to {OUTPUT_PATH}")
 
 if __name__ == "__main__":
     main()
