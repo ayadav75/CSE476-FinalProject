@@ -21,12 +21,10 @@ FILE_LOCK = threading.Lock()   # Prevents JSON corruption
 
 # File Paths
 INPUT_PATH = Path("cse_476_final_project_test_data.json") 
-OUTPUT_PATH = Path("cse_476_final_project_answers.json")
+OUTPUT_PATH = Path("cse_476_final_project_answers_test.json")
 
 # Modified API client
-
 def call_llm(messages: List[Dict[str, str]], temperature: float = 0.0, max_tokens: int = 2048) -> str:
-    """Standard API wrapper with retry logic."""
     url = f"{API_BASE}/chat/completions"
     headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
     payload = {
@@ -49,9 +47,6 @@ def call_llm(messages: List[Dict[str, str]], temperature: float = 0.0, max_token
 
 # Tool: Internet Search (DuckDuckGo) 
 def internet_search(query: str, num_results: int = 3) -> str:
-    """
-    Performs a DuckDuckGo Search and returns a summary string.
-    """
     # print(f"\n[Search] Query: {query}") 
     # To avoid getting banned I have used locks for searches
     with SEARCH_LOCK:
@@ -247,7 +242,7 @@ class AgentStrategies:
         system = (
             "You are a forecaster. The user asks for a prediction.\n"
             "Your output must be wrapped in \\boxed{}.\n"
-            "If multiple items, use a list format inside the box: \\boxed{['Item1', 'Item2']}.\n"
+            "If multiple items, use a list format inside the box like: \\boxed{['Item1', 'Item2']}.\n"
             "If a single item, just put the item: \\boxed{Yes} or \\boxed{10.5}."
         )
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user_input}]
